@@ -61,5 +61,5 @@
 
 ### Try it out
 
-![EcoInsight][https://ecoinsight-nu.vercel.app/]
+[EcoInsight](https://ecoinsight-nu.vercel.app/)
 

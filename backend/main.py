@@ -11,14 +11,16 @@ import vertexai.generative_models as genai
 from story_ai import create_prompt
 from sentence_transformers import SentenceTransformer
 import numpy as np
+import asyncio
+import aiohttp
 
 # Load environment variables
 load_dotenv()
 
 # Initialize Vertex AI directly here (don't rely on story_ai module)
-PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT", "ecoinsight-2025")
-LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
-
+PROJECT_ID = os.getenv("PROJECT_ID")
+LOCATION = os.getenv("REGION")
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 vertexai.init(project=PROJECT_ID, location=LOCATION)
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 
@@ -57,34 +59,52 @@ class SemanticSearchRequest(BaseModel):
 @app.post("/generate-climate-story")
 async def generate_climate_story(data: ClimateRequest):
     try:
-        print(f"Generating story for city: {data.city}")
-        
-        # 1. Fetch latest weather for the city
-        weather_doc = await db.weather.find_one(
-            {"city": data.city},
-            sort=[("timestamp", -1)]
-        )
-        
-        if not weather_doc:
-            raise HTTPException(status_code=404, detail=f"No weather data found for city: {data.city}")
+        city = data.city
+       
 
-        # 2. Format it as climate_data string
+        # --- 1. Fetch weather data ---
+        weather_url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={OPENWEATHER_API_KEY}&units=metric"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(weather_url) as weather_resp:
+                if weather_resp.status != 200:
+                    raise HTTPException(status_code=404, detail=f"City not found: {city}")
+                weather_data = await weather_resp.json()
+
+            lat = weather_data["coord"]["lat"]
+            lon = weather_data["coord"]["lon"]
+
+            # --- 2. Fetch air quality data ---
+            aqi_url = f"http://api.openweathermap.org/data/2.5/air_pollution?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}"
+
+            async with session.get(aqi_url) as aqi_resp:
+                if aqi_resp.status != 200:
+                    raise HTTPException(status_code=404, detail=f"Air quality data not available for: {city}")
+                aqi_data = await aqi_resp.json()
+
+        components = aqi_data["list"][0]["components"]
+        aqi_value = aqi_data["list"][0]["main"]["aqi"]
+
+        # --- 3. Format climate summary ---
         climate_data = f"""
-        - Temperature: {weather_doc['temperature']}°C
-        - Weather: {weather_doc['weather']}
-        - Humidity: {weather_doc['humidity']}%
-        - Wind Speed: {weather_doc['wind_speed']} m/s
+        - Temperature: {weather_data['main']['temp']}°C
+        - Weather: {weather_data['weather'][0]['description'].capitalize()}
+        - Humidity: {weather_data['main']['humidity']}%
+        - Wind Speed: {weather_data['wind']['speed']} m/s
+        - AQI: {aqi_value} (1=Good, 5=Very Poor)
+        - PM2.5: {components['pm2_5']} µg/m³
+        - PM10: {components['pm10']} µg/m³
+        - CO: {components['co']} µg/m³
+        - NO₂: {components['no2']} µg/m³
+        - O₃: {components['o3']} µg/m³
         """
-        
-        print(f"Climate data: {climate_data}")
 
-        # 3. Create prompt
-        prompt = create_prompt(data.city, climate_data)
-        print(f"Generated prompt length: {len(prompt)} characters")
-        
-        
+      
+
+        # --- 4. Create prompt ---
+        prompt = create_prompt(city, climate_data)
+
         model = GenerativeModel("gemini-2.0-flash-001")
-        
         response = model.generate_content(
             prompt,
             generation_config=genai.GenerationConfig(
@@ -94,14 +114,10 @@ async def generate_climate_story(data: ClimateRequest):
                 top_p=0.8
             )
         )
-        
-        story_text = response.text
-        
 
-
-               
+        story_text = response.text       
         embedding = embedding_model.encode(story_text)
-        embedding_list = embedding.tolist()  # Convert NumPy array to list for MongoDB
+        embedding_list = embedding.tolist() 
 
         # 6.2 Prepare document
         story_doc = {
@@ -116,8 +132,7 @@ async def generate_climate_story(data: ClimateRequest):
 
         
         result = await stories_collection.insert_one(story_doc)
-        print(f"Story saved to MongoDB with ID: {result.inserted_id}")
-        
+      
         return {
             "story": story_text, 
             "id": str(result.inserted_id),
@@ -130,15 +145,39 @@ async def generate_climate_story(data: ClimateRequest):
         print(f"Error type: {type(e)}")
         raise HTTPException(status_code=500, detail=f"Error generating story: {str(e)}")
     
+
 @app.post("/search")
 async def semantic_search(request: SemanticSearchRequest):
     try:
-        query_embedding = embedding_model.encode(request.query).tolist()
+       
         
+        # Generate query embedding
+        query_embedding = embedding_model.encode(request.query).tolist()
+       
+        
+        # First, let's check if we have any documents at all
+        total_docs = await stories_collection.count_documents({})
+       
+        
+        if total_docs == 0:
+            return {"results": [], "debug": "No documents found in collection"}
+        
+        # Check if documents have embeddings
+        sample_doc = await stories_collection.find_one({})
+  
+        
+        if sample_doc and "embedding" in sample_doc:
+            print(f"Sample embedding shape: {len(sample_doc['embedding']) if sample_doc['embedding'] else 'None'}")
+        else:
+            print("No embedding field found in sample document")
+            # Fallback to text search if no embeddings
+            return await fallback_text_search(request.query, request.top_k)
+        
+        # Vector search pipeline
         pipeline = [
             {
                 "$vectorSearch": {
-                    "index": "vector_index",  # name of your vector index
+                    "index": "vector_index",  # Make sure this matches your actual index name
                     "path": "embedding",
                     "queryVector": query_embedding,
                     "numCandidates": 100,
@@ -156,17 +195,64 @@ async def semantic_search(request: SemanticSearchRequest):
                 }
             }
         ]
-
+        
         results = []
         async for doc in stories_collection.aggregate(pipeline):
             results.append(doc)
+            
+      
         
+        # If vector search returns no results, try fallback
+        if not results:
+            print("No vector search results, trying fallback text search...")
+            return await fallback_text_search(request.query, request.top_k)
+            
         return {"results": results}
-
+        
     except Exception as e:
-        print(f"Semantic search error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Semantic search failed: {str(e)}")
+        print(f"Search error: {str(e)}")
+        print(f"Error type: {type(e)}")
+        
+        # Try fallback search on error
+        try:
+            return await fallback_text_search(request.query, request.top_k)
+        except Exception as fallback_error:
+            print(f"Fallback search also failed: {str(fallback_error)}")
+            return {"results": [], "error": str(e)}
 
+async def fallback_text_search(query: str, limit: int = 5):
+    """Fallback to text-based search when vector search fails"""
+    print(f"Performing fallback text search for: {query}")
+    
+    # Simple text search using regex
+    text_pipeline = [
+        {
+            "$match": {
+                "$or": [
+                    {"story_text": {"$regex": query, "$options": "i"}},
+                    {"location": {"$regex": query, "$options": "i"}}
+                ]
+            }
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "location": 1,
+                "story_text": 1,
+                "climate_data": 1,
+                "created_at": 1,
+                "score": 1  # No vector score available
+            }
+        },
+        {"$limit": limit}
+    ]
+    
+    results = []
+    async for doc in stories_collection.aggregate(text_pipeline):
+        results.append(doc)
+    
+    print(f"Fallback search results: {len(results)}")
+    return {"results": results, "search_type": "text_fallback"}
 
 
 

@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+motor
+aiohttp
+sentence-transformers
+numpy
+google-cloud-aiplatform
+vertexai

@@ -1,9 +1,9 @@
 'use client';
 export const dynamic = 'force-dynamic';
 import { useSearchParams } from 'next/navigation';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, Suspense } from 'react';
 
-export default function StoryPage() {
+function StoryContent() {
   const searchParams = useSearchParams();
   const city = searchParams.get('city') || '';
   const storyParam = searchParams.get('story') || '';
@@ -157,5 +157,28 @@ export default function StoryPage() {
         )}
       </div>
     </div>
+  );
+}
+
+// Loading component for Suspense fallback
+function LoadingPage() {
+  return (
+    <div
+      className="min-h-screen bg-cover bg-center bg-no-repeat p-6 flex flex-col items-center justify-center"
+      style={{ backgroundImage: 'url(/bg2.png)' }}
+    >
+      <div className="bg-white/70 backdrop-blur-md rounded-2xl shadow-xl p-8 w-full max-w-4xl text-gray-800 text-center">
+        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-green-600 mx-auto mb-4"></div>
+        <p className="text-gray-600">Loading climate story...</p>
+      </div>
+    </div>
+  );
+}
+
+export default function StoryPage() {
+  return (
+    <Suspense fallback={<LoadingPage />}>
+      <StoryContent />
+    </Suspense>
   );
 }
